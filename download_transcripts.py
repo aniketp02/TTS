@@ -1,13 +1,31 @@
 import logging
-import sys
+import sys, uuid
 import time
 import boto3
 import json
 from botocore.exceptions import ClientError
 import requests
+import os, argparse
 
 from custom_waiter import CustomWaiter, WaitState
 
+parser = argparse.ArgumentParser(description='Create and download the Transcript from AWS Transcribe')
+
+parser.add_argument('--bucket', type=str, 
+					help='S3 bucket where the audio files are stored', required=True)
+parser.add_argument('--out_folder', type=str, 
+					help='[Local] output folder path to store the Transcription files (JSON)', required=True)
+parser.add_argument('--file_name', type=str, 
+                    help='Name of the file on AWS S3 bucket, The object key and file name shld be same on S3', required=True)
+parser.add_argument('--lang_code', default='en-IN', type=str, 
+		            help='AWS Transcribe language code to generate the transcripts (hi-IN) for hindi')
+parser.add_argument('--media_format', default='wav', type=str, 
+		            help='Media format of the audio files')
+parser.add_argument('--region', default='us-east-1', type=str, 
+					help='AWS Region to create the transcription jobs')
+
+
+args = parser.parse_args()
 logger = logging.getLogger(__name__)
 
 class TranscribeCompleteWaiter(CustomWaiter):
@@ -82,55 +100,50 @@ def get_job(job_name, transcribe_client):
         return job
 
 
-ACCESS_ID = '' # AWS access ID
-ACCESS_KEY = '' # AWS access key
+ACCESS_ID = os.getenv('MY_ACCESS_KEY_ID') # AWS credentials
+ACCESS_KEY = os.getenv('MY_SECRET_ACCESS_KEY')
 
 
 s3_resource = boto3.resource('s3', aws_access_key_id=ACCESS_ID, aws_secret_access_key=ACCESS_KEY)
-transcribe_client = boto3.client('transcribe', region_name='ap-south-1', aws_access_key_id=ACCESS_ID, aws_secret_access_key=ACCESS_KEY)
+transcribe_client = boto3.client('transcribe', region_name=args.region, aws_access_key_id=ACCESS_ID, aws_secret_access_key=ACCESS_KEY)
 
-bucket_name = 'bucket2-audio'  #name of the bucked where the audio files are stored
 
-# For loop to iterate over all the audio files
-for i in range(1, 176):
-    media_file_name = 'anupama_chopra/' + str(i) + '.mp3'  #Media file name on aws s3, in this case the files were in folder anupama_chopra with names 1.mp3, 2.mp3...
-    media_object_key = 'anupama_chopra/' + str(i) + '.mp3'
-    job_name_simple = 'anupama_chopra-' + str(i) #any name for creating a transcription job
+media_file_name = args.file_name
+media_object_key = args.file_name
+transcript_name = args.file_name.split('/')[-1][:-4]
+transcript_job = transcript_name + uuid.uuid4().hex
+media_uri = f's3://{args.bucket}/{media_object_key}'
+print(f"Starting transcription job {transcript_job}.")
 
-    media_uri = f's3://{bucket_name}/{media_object_key}'
-    print(f"Starting transcription job {job_name_simple}.")
+start_job(
+    transcript_job, f's3://{args.bucket}/{media_object_key}', args.media_format, args.lang_code,
+    transcribe_client)
+transcribe_waiter = TranscribeCompleteWaiter(transcribe_client)
+transcribe_waiter.wait(transcript_job)
+job_simple = get_job(transcript_job, transcribe_client)
+transcript_simple = requests.get(
+    job_simple['Transcript']['TranscriptFileUri']).json()
+print(f"Transcript for job {transcript_simple['jobName']}:")
+transcript_line = transcript_simple['results']['transcripts'][0]['transcript']
+print(transcript_line) #This prints the transcripts of the audio file
 
-    start_job(
-        job_name_simple, f's3://{bucket_name}/{media_object_key}', 'mp3', 'en-IN',
-        transcribe_client)
-    transcribe_waiter = TranscribeCompleteWaiter(transcribe_client)
-    transcribe_waiter.wait(job_name_simple)
-    job_simple = get_job(job_name_simple, transcribe_client)
-    transcript_simple = requests.get(
-        job_simple['Transcript']['TranscriptFileUri']).json()
-    print(f"Transcript for job {transcript_simple['jobName']}:")
-    transcript_line = transcript_simple['results']['transcripts'][0]['transcript']
-    print(transcript_line) #This prints the transcripts of the audio file
-
-    # To store the transcripts in a text file;
-    with open('transcripts_all.txt', 'a+') as f:
-        line = str(i)+'.mp3|'+transcript_line
-        f.write(line)
-        f.write('\n')
-        f.write('\n')
-    f.close()
+# To store the transcripts in a text file;
+with open('transcripts_all.txt', 'a+') as f:
+    line = args.file_name + '|'+transcript_line
+    f.write(line)
+    f.write('\n')
+    f.write('\n')
+f.close()
     
 
-# This code downloads the json transcription files with all other metadata like start time, endtime, confidence etc from aws transcribe
-# For loop to iterate over all the transcription jobs
-for i in range(1, 176):
-    job_name_simple = 'anupama_chopra-' + str(i)
-    job_simple = get_job(job_name_simple, transcribe_client)
-    transcript_simple = requests.get(job_simple['Transcript']['TranscriptFileUri']).json()
+# This code downloads the json transcription files with all other metadata like start time, 
+# endtime, confidence etc from aws transcribe
+job_simple = get_job(transcript_job, transcribe_client)
+transcript_simple = requests.get(job_simple['Transcript']['TranscriptFileUri']).json()
 
 
-    json_file = 'json_anupama/' + job_name_simple + '.json' #json file name to store the transcription details
+json_file = args.out_folder + transcript_name + '.json' #json file name to store the transcription details
 
-    with open(json_file, 'w', encoding='utf-8') as f:
-        json.dump(transcript_simple, f, ensure_ascii=False, indent=4)
-    print(f"Downloaded the json file for job {i}")
+with open(json_file, 'w', encoding='utf-8') as f:
+    json.dump(transcript_simple, f, ensure_ascii=False, indent=4)
+print(f"Downloaded the json file for job {transcript_job}")
